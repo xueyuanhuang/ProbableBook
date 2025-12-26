@@ -48,6 +48,14 @@ def parse_args():
     parser.add_argument("--tg-token", help="Telegram Bot Token (overrides TG_BOT_TOKEN env var)")
     parser.add_argument("--tg-chat-id", help="Telegram Chat ID (overrides TG_CHAT_ID env var)")
     
+    # Watch Mode Arguments
+    parser.add_argument("--list-markets", action="store_true", help="List all discovered markets with indices and exit")
+    parser.add_argument("--watch-index", type=int, help="Index of the market to watch (from --list-markets)")
+    parser.add_argument("--side", choices=["YES", "NO"], type=str.upper, help="Side to watch (YES or NO)")
+    parser.add_argument("--trigger-price", type=float, help="Price threshold to trigger alert")
+    parser.add_argument("--trigger-op", choices=[">=", ">", "<=", "<"], default=">=", help="Trigger operator (default: >=)")
+    parser.add_argument("--alert-cooldown", type=int, default=300, help="Seconds between alerts in watch mode (default: 300, 0=always)")
+    
     parser.add_argument("--test-telegram", action="store_true", help="Send a test Telegram message and exit")
     return parser.parse_args()
 
@@ -208,6 +216,187 @@ def get_best_price(book: dict, side: str) -> Optional[Decimal]:
         return max(prices)
     else:
         return min(prices)
+
+def get_best_bid_details(book: dict) -> Optional[tuple[Decimal, Decimal, list]]:
+    """
+    Extracts the best bid (BUY1) price and its aggregated size from the orderbook.
+    Returns (price, aggregated_size, raw_entries) tuple or None.
+    Bids are sorted descending (highest price first).
+    """
+    if not book or 'bids' not in book:
+        return None
+    
+    orders = book['bids']
+    if not orders:
+        return None
+    
+    try:
+        # Parse all orders to (price, size, raw_order)
+        parsed_orders = []
+        for o in orders:
+            p = Decimal(str(o['price']))
+            s = Decimal(str(o['size']))
+            parsed_orders.append((p, s, o))
+            
+        if not parsed_orders:
+            return None
+
+        # Sort based on price DESCENDING for Bids
+        parsed_orders.sort(key=lambda x: x[0], reverse=True)
+        
+        best_price = parsed_orders[0][0]
+        
+        # Filter orders at best price level and aggregate size
+        best_level_orders = [x for x in parsed_orders if x[0] == best_price]
+        aggregated_size = sum(x[1] for x in best_level_orders)
+        
+        raw_entries = [x[2] for x in best_level_orders]
+        
+        return best_price, aggregated_size, raw_entries
+    except Exception:
+        return None
+
+def sort_markets_deterministically(markets: list) -> list:
+    """
+    Sorts markets by title, then market_slug to ensure stable indexing.
+    """
+    return sorted(markets, key=lambda m: (m.get('title', ''), m.get('market_slug', '')))
+
+def discover_and_sort_markets(args) -> list:
+    """
+    Helper to discover and sort markets.
+    """
+    discovery = DiscoveryService()
+    limit = args.max_events or args.max_markets
+    markets = discovery.discover_markets(max_events=limit)
+    return sort_markets_deterministically(markets)
+
+def print_market_list(markets: list):
+    """
+    Prints a numbered list of markets.
+    """
+    print(f"\nDiscovered {len(markets)} markets:\n")
+    print(f"{'IDX':<5} | {'TITLE':<50} | {'SLUG'}")
+    print("-" * 100)
+    for idx, m in enumerate(markets):
+        title = (m.get('title') or "")[:48]
+        slug = (m.get('market_slug') or "")
+        print(f"{idx:<5} | {title:<50} | {slug}")
+    print("\n")
+
+def check_trigger(current_price: float, op: str, trigger_price: float) -> bool:
+    if op == ">=":
+        return current_price >= trigger_price
+    elif op == ">":
+        return current_price > trigger_price
+    elif op == "<=":
+        return current_price <= trigger_price
+    elif op == "<":
+        return current_price < trigger_price
+    return False
+
+async def run_watch_mode(args):
+    # 1. Discovery
+    markets = discover_and_sort_markets(args)
+    if not markets:
+        logger.error("No markets found.")
+        sys.exit(1)
+        
+    # 2. Validation
+    if args.watch_index < 0 or args.watch_index >= len(markets):
+        logger.error(f"Invalid index {args.watch_index}. Valid range: 0-{len(markets)-1}")
+        logger.info("Run --list-markets to see available markets.")
+        sys.exit(1)
+        
+    if not args.side or not args.trigger_price:
+        logger.error("--side and --trigger-price are required for watch mode.")
+        sys.exit(1)
+        
+    target_market = markets[args.watch_index]
+    logger.info(f"WATCH MODE STARTED")
+    logger.info(f"Market: {target_market['title']}")
+    logger.info(f"ID:     {target_market['market_slug']}")
+    logger.info(f"Side:   {args.side}")
+    logger.info(f"Trigger: BUY1 {args.trigger_op} {args.trigger_price}")
+    
+    token_id = target_market['yes_token_id'] if args.side == 'YES' else target_market['no_token_id']
+    
+    last_alert_ts = 0
+    
+    while True:
+        start_time = time.time()
+        
+        async with aiohttp.ClientSession() as session:
+            book = await fetch_book(session, token_id)
+            
+            # Extract Buy1
+            details = get_best_bid_details(book)
+            
+            status = "NA"
+            buy1_price = 0.0
+            size = 0.0
+            notional = 0.0
+            diff = 0.0
+            triggered = False
+            
+            if details:
+                buy1_price = float(details[0])
+                size = float(details[1])
+                notional = buy1_price * size
+                diff = buy1_price - args.trigger_price
+                
+                # Check Trigger
+                triggered = check_trigger(buy1_price, args.trigger_op, args.trigger_price)
+                status = "TRIGGERED" if triggered else "OK"
+            
+            # Output
+            ts = datetime.now().strftime('%H:%M:%S')
+            
+            if args.pretty:
+                # Table Row
+                # Time | Status | Price | Diff | Notional
+                color = "\033[91m" if triggered else "\033[92m" # Red if triggered, Green if OK
+                reset = "\033[0m"
+                print(f"[{ts}] {color}{status:<10}{reset} | Price: {buy1_price:.4f} | Diff: {diff:+.4f} | Notional: ${notional:.2f}")
+            else:
+                logger.info(f"[{ts}] Status={status} Price={buy1_price:.4f} Diff={diff:+.4f} Notional=${notional:.2f}")
+                
+            # Alert Logic
+            if triggered:
+                now = time.time()
+                should_alert = False
+                
+                if args.alert_cooldown == 0:
+                    should_alert = True
+                elif (now - last_alert_ts) >= args.alert_cooldown:
+                    should_alert = True
+                    
+                if should_alert:
+                    # Send TG
+                    tg_token = args.tg_token or os.environ.get("TG_BOT_TOKEN")
+                    tg_chat_id = args.tg_chat_id or os.environ.get("TG_CHAT_ID")
+                    
+                    if tg_token and tg_chat_id:
+                        msg = f"🚨 *Probable Market Watch*\n"
+                        msg += f"Market: {target_market['title']}\n"
+                        msg += f"Side: {args.side}\n"
+                        msg += f"Trigger: {buy1_price:.4f} {args.trigger_op} {args.trigger_price}\n"
+                        msg += f"Notional: ${notional:.2f}\n"
+                        msg += f"URL: {target_market['url']}"
+                        
+                        logger.info("Sending Telegram Alert...")
+                        await send_telegram_alert(tg_token, tg_chat_id, msg)
+                        last_alert_ts = now
+                    else:
+                        logger.warning("Triggered but TG not configured.")
+
+        if args.once:
+            break
+            
+        elapsed = time.time() - start_time
+        sleep_time = max(0, args.interval - elapsed)
+        if sleep_time > 0:
+            await asyncio.sleep(sleep_time)
 
 async def process_market(session: aiohttp.ClientSession, market: dict) -> Optional[dict]:
     """
@@ -446,14 +635,10 @@ async def run_fetcher(args):
             await asyncio.sleep(sleep_time)
 
 def main():
-    # Enforce venv usage check
     if sys.prefix == sys.base_prefix:
-        logger.warning("************************************************************")
-        logger.warning("* WARNING: Not running inside a virtual environment (venv) *")
-        logger.warning("* Please activate your venv before running this script.    *")
-        logger.warning("************************************************************")
-        # Optional: You could raise SystemExit(1) if you want to be strictly blocking,
-        # but the user asked for a warning.
+        logger.error("ProbableBook must be run inside a Python virtual environment (venv).")
+        logger.error("Hint: source venv/bin/activate")
+        sys.exit(1)
     
     args = parse_args()
     
@@ -462,12 +647,29 @@ def main():
     tg_chat_id = args.tg_chat_id or os.environ.get("TG_CHAT_ID")
     logger.info(f"Configuration: TG_BOT_TOKEN detected: {bool(tg_token)}, TG_CHAT_ID detected: {bool(tg_chat_id)}, Alert Threshold: {args.alert_sum_threshold}")
 
+    # 1. List Markets Mode
+    if args.list_markets:
+        markets = discover_and_sort_markets(args)
+        if not markets:
+            logger.error("No markets found.")
+            return
+
+        print_market_list(markets)
+        return
+
+    # 2. Test Telegram Mode
     if args.test_telegram:
         asyncio.run(test_telegram_mode(args))
         return
 
+    # 3. Execution Mode (Watch vs Scan)
     try:
-        asyncio.run(run_fetcher(args))
+        if args.watch_index is not None:
+            # Watch Mode
+            asyncio.run(run_watch_mode(args))
+        else:
+            # Scan All Mode (Original)
+            asyncio.run(run_fetcher(args))
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
     except Exception as e:
